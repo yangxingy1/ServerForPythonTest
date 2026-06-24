@@ -1,0 +1,2 @@
+# ServerForPythonTest
+为agent测试搭建的样例游戏环境
