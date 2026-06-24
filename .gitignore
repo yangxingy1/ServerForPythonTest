@@ -1,0 +1,5 @@
+.claude/*
+_pycache_/*
+runtime/*
+*.code-workspace
+*.txt
