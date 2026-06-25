@@ -16,6 +16,7 @@ class Player:
         self.rewards = []     # [{type, amount, ts}, ...]
         self.wins = 0
 
+    # 从本地文件加载
     def load(self):
         path = _player_path(self.player_id)
         if os.path.exists(path):
@@ -29,6 +30,7 @@ class Player:
         else:
             self.save()
 
+    # 写入本地文件
     def save(self):
         path = _player_path(self.player_id)
         os.makedirs(os.path.dirname(path), exist_ok=True)

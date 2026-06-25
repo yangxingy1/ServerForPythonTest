@@ -1,3 +1,5 @@
+# 结算状态 : bool
+
 _settled = False
 
 

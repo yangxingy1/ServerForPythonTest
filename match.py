@@ -31,7 +31,7 @@ class Match:
         self.move_deadline = self.timesrc.now() + MATCH["move_timeout_sec"]
 
     def play(self, player_id, move):
-        """玩家出手。返回 (accepted, msg)"""
+        # 玩家出手。返回 (accepted, msg)
         if self.finished:
             return False, "match already finished"
         if self.current_mover is None:
@@ -61,7 +61,7 @@ class Match:
         return True, "ok"
 
     def check_timeout(self):
-        """检查是否超时。若超时，自动判定。返回是否有变化。"""
+        # 检查是否超时。若超时，自动判定。返回是否有变化
         if self.finished:
             return False
         if self.current_mover != "both":

@@ -3,7 +3,7 @@ import json
 import sys
 from config import ADMIN
 
-
+# 时间调整文件 -> 跳转到虚拟时间点
 def main():
     if len(sys.argv) < 2:
         print("Usage: python admin.py settime \"2026-07-01 18:00:00\"")

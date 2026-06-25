@@ -1,7 +1,7 @@
 from config import SHOP_ITEMS
 from reward import reward
 
-
+# 商品id -> 剩余量
 shop_stock = {}
 
 

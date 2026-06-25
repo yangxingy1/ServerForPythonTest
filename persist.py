@@ -5,12 +5,12 @@ from config import PERSIST
 
 _snapshot = {}
 
-
+# 保存快照
 def save_snapshot(section, data):
     _snapshot[section] = data
     _write_file()
 
-
+# 返回快照
 def load_snapshot():
     global _snapshot
     path = PERSIST["snapshot_path"]

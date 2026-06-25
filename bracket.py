@@ -9,7 +9,7 @@ def _fmt_ts(ts):
 
 
 def generate_bracket(player_ids, seed=None):
-    """随机打乱 32 个 player_id，填入 32 个槽位。返回槽位列表 (1-indexed)"""
+    # 随机打乱 32 个 player_id, 填入 32 个槽位. 返回槽位列表 (1-indexed)
     rng = random.Random(seed)
     shuffled = list(player_ids)
     rng.shuffle(shuffled)
@@ -18,7 +18,7 @@ def generate_bracket(player_ids, seed=None):
 
 
 class Bracket:
-    """固定槽位规则晋级"""
+    # 固定槽位规则晋级
 
     def __init__(self):
         self.slots = {}          # slot_id -> player_id
@@ -31,7 +31,7 @@ class Bracket:
         self._save()
 
     def get_matchups(self, round_num):
-        """返回本轮所有对阵: [(slot_a, slot_b, player_a, player_b), ...]"""
+        # 返回本轮所有对阵: [(slot_a, slot_b, player_a, player_b), ...]
         if round_num == 1:
             matchups = []
             for i in range(1, 33, 2):
@@ -66,7 +66,7 @@ class Bracket:
         return None
 
     def get_player_wins(self, player_id):
-        """统计该玩家累计胜场数"""
+        # 统计该玩家累计胜场数
         wins = 0
         for match_index, winner_slot in self.round_winners.get(1, {}).items():
             if self.slots[winner_slot] == player_id:
