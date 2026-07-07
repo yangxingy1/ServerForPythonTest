@@ -1,445 +1,235 @@
-# 32 强猜拳锦标赛服务端 — 接口契约与测试编写指南
+# 任务：用纯 Python 写一个 32 人猜拳淘汰赛服务器（AI 测试床）
 
-> **本文件供自动测试生成 agent 阅读。** 目标是消除"用例与接口不符"类失败。
-> 下面每一条"❌ 错误写法 / ✅ 正确写法"都对应过往真实跑挂的用例,**生成用例前务必通读**。
-> 黄金法则:**只调用本文件和源码中确实存在的接口,严格按这里写明的返回值结构、容器类型、状态前置条件来断言。拿不准就读源码,不要臆测。**
-
----
-
-## 1. 系统概览
-
-- 32 人**单败淘汰**猜拳锦标赛,共 **5 轮**:32 → 16 → 8 → 4 → 2 → 1(冠军),全程 **31 场** Match(16+8+4+2+1)。
-- 单场 Match 为 **3 局 2 胜**制。
-- 活动是**时间驱动状态机**,**没有后台定时器**:状态只在显式调用 `tick()`(或通过 socket 的 `settime`/`advancetime`)时才推进。
-- 三类持久化:快照文件(`runtime/snapshot.json`)、玩家文件(`runtime/players/<player_id>.json`),路径由 `config.PERSIST` 配置、测试时可重定向。
-- 模块清单:`activity`(核心状态机)、`match`、`bracket`、`shop`、`settlement`、`player`、`reward`、`persist`、`timesrc`、`server`(TCP 入口)、`config`。
-
-> **测试分层建议(重要)**:
-> - **端到端(socket / e2e)是回归主力**——跨真实进程与协议、最接近线上,且不耦合任何内部结构,鲁棒性最高。协议一致性、鉴权、状态守卫、关键业务路径优先用 e2e 覆盖。见 §9 的**共享 server fixture**(全程一个进程,杜绝端口争用)。
-> - **进程内(inprocess)用于 e2e 测不到的内部不变式**——资金守恒(结算发币、扣分减库存)、崩溃恢复一致性、`_pending_moves` 等内部状态。这类强耦合内部约定,**少而精**即可,严格按 §4/§5/§7/§8 的真实结构写,否则跑到断言前就崩。
-> - 状态名只有 `NOT_STARTED / LOGIN_OPEN / RUNNING / SCORED / SETTLED` 五个(见 §5),**没有 `INIT`**;断言状态时用这五个字符串。
+> 这份代码是 AI 精细测试流程的**被测对象**。重点不是好看，而是
+> "赛事生命周期 + 跨模块结算 + 崩溃恢复"这三层要真实、立得住。
+> 只用标准库，不要 Web 框架。形态为真·服务端 + 单账号客户端（裸 socket）。
 
 ---
 
-## 2. 时间字段是字符串,不能直接做数值运算 ⚠️
+## 业务：限时 32 人单淘汰猜拳赛
 
-`config.py` 里所有时间字段都是 **`"YYYY-MM-DD HH:MM:SS"` 格式的字符串**,不是 Unix 时间戳:
+### 账号
+- 32 个账号预分配（`player_01` ~ `player_32`）
+- 登录给 `player_id` 即算登录，不校验密码
+
+### 时间线（全部从 config 读，且**必须可注入假时间源**——禁止直接用 `time.time()`）
+- 07/01 17:30  开放登录（仅登录，不开赛）
+- 07/01 18:00  开赛，逐轮自动推进
+- 冠军产生      发积分，开商店
+- 07/02 24:00  结算：剩余积分 1:1 退 梦幻币，活动关闭
+
+### 服务器时间（可配 + 可改，测试命脉）
+- **启动时间可配**：服务端启动时从 config / 启动参数读"服务器初始时间"，
+  服务器内部时钟从这个时间起算（不绑系统真实时间）
+- **时间持续流逝**：服务器时间 = 初始基准 + 真实流逝秒数。设好基准后时间会自己往前走
+  （和真实世界同速），**不冻结**
+- **运行时可改**：支持随时通过指令修改服务器当前时间，本质是调整时间偏移量：
+  `{"cmd": "settime", "ts": "2026-07-01 18:00:00"}`（把当前时间跳到该绝对时间，之后继续流逝）
+  `{"cmd": "advancetime", "seconds": 60}`（当前时间向前跳 60 秒，之后继续流逝）
+- 实现要点：内部存一个 `offset`，`now() = 真实now() + offset`；改时间即改 `offset`，时间照常流动
+- 改时间后，状态机迁移、出手超时判定、结算触发都要按新时间立即重新评估
+- 这是测试方驱动"开关瞬间 / 超时 / 07/02 24:00 结算"的主要手段
+
+### 状态机（时间驱动迁移）
+```
+NOT_STARTED → LOGIN_OPEN → RUNNING → SCORED → SETTLED
+```
+
+### 对战表（预生成）
+- 开赛前生成一次：把 32 个账号**随机打乱**填入 32 个固定槽位（slot 1~32）
+- 晋级按**固定槽位规则**进行（与玩家是谁无关）：
+  * 第 1 轮：slot 1 vs 2、slot 3 vs 4、……、slot 31 vs 32（16 场）
+  * 第 2 轮：(1,2 胜者) vs (3,4 胜者)、(5,6 胜者) vs (7,8 胜者)、……
+  * 以此类推到决赛，共 5 轮
+- 随机排位**只在开赛前做一次**，生成后立即落盘（快照）
+- 崩溃重启必须恢复**同一张对战表**，不能重新随机——否则恢复后对阵错位
+- 建议随机用可配 `seed`，方便测试复现某一张特定对阵
+
+### 单场规则（3 局两胜）
+- 每局双方各出 石头/剪刀/布
+- 每次出手限时 60 秒（用可注入时间源判定），超时判该局负
+- 先赢 2 局者胜，晋级
+- 默认边界规则（按此实现）：
+  * 双方同手 → 本局平局，重出，计时重置，不计胜负
+  * 双方都超时 → 本局平局，重出
+  * 玩家未登录 / 不出手 → 每局超时判负
+
+### 断线重连
+- **断线本身不判负**，只有"出手超时"才判负。网络断开 ≠ 认输
+- 服务端按 `player_id` 保存对局会话状态，断线后状态不丢
+- 客户端重连（重新 login 同一 `player_id`）后，服务端必须把当前状态同步回去：
+  * 当前在第几轮、对手是谁
+  * 本场已打的局比分（如 1 胜 1 负）
+  * **前两局的逐局结果**（每局各自出了什么、谁赢）
+  * 当前是否轮到他出手、本局出手剩余时间
+- 例：玩家打到 1-1 时断线，重连后能收到前两局结果，并继续猜第三局
+- 出手计时在断线期间**照常走**（不暂停）——若重连时已超时，则该局判负
+
+### 赛后积分
+- 积分 = 该玩家累计胜场数 × 100（配置项：每胜场分值）
+- 冠军 5 胜 = 500
+- 全场积分总和应为固定值 **3100**（500 + 400 + 300×2 + 200×4 + 100×8）
+- 积分发放走统一的"发奖入口"（见下）
+
+### 商店（SCORED 状态开放，至 07/02 24:00）
+- 玩家用积分买道具
+- 道具表：
+
+  | 道具 | id | 单价 | 每人限购 | 库存（全场） |
+  |---|---|---|---|---|
+  | 香蕉 | banana | 100 | 1 | 10 |
+  | 苹果 | apple | 50 | 2 | 30 |
+  | 雪梨 | pear | 20 | 不限 | 不限 |
+
+- 限购为累计值（跨多次购买累加），库存为全场共享
+- 买成功 → 扣积分 + 走"发奖入口"发货
+
+### 结算（07/02 24:00，SCORED → SETTLED）
+- 剩余积分按 1:1 退 梦幻币（比例配置）
+- 退款走"发奖入口"
+- **必须幂等**：重复触发 SETTLED 不重复退
+- 结算后买道具一律拒绝
+
+### 发奖入口（统一）
+- 所有"给玩家东西 / 扣玩家东西"都走**同一个函数**：发积分、商店发货（发道具+扣积分）、
+  结算退梦幻币（把剩余积分折算成梦幻币发给玩家）
+- 该函数做两件事：
+  1. **修改玩家内存对象**对应资源（积分 / 梦幻币 / 道具），并**落玩家存盘**
+  2. 建单 + 打印一行日志，格式如：
+     ```
+     [REWARD] player=player_07 type=梦幻币 amount=300 ts=...
+     ```
+- 即：奖励、积分、梦幻币的任何获得 / 消耗，都必须真正写进玩家数据并存盘，
+  不能只打印日志、不落盘（否则下线 / 崩溃后数据对不上）
+
+### 玩家数据管理（独立存盘 + 上线加载 / 下线销毁）
+玩家数据要**独立于赛事全局状态单独管理、单独存盘**（模拟真实游戏服务器的玩家对象生命周期）。
+- 每个玩家有一份独立的持久化数据（建议一人一文件，如 `runtime/players/player_07.json`），
+  内容含：积分、梦幻币、道具（背包 / 已发货）、商店购买记录、累计胜场等
+- **上线（login）**：从盘加载该玩家数据，创建一个**内存玩家对象**承载这些数据；
+  盘上没有则按初始值新建
+- **在线期间**：所有读写都走内存玩家对象（不是每次都读盘）；
+  奖励 / 积分 / 梦幻币 / 道具的任何获得或消耗（统一经发奖入口）都要**落盘持久化**
+- **下线（断开连接）**：把内存玩家对象**销毁**（释放），销毁前必须先存盘，
+  保证下线时数据不丢
+- 再次上线：重新从盘加载，恢复到下线前的数据
+- 注意区分两类持久化：
+  * **玩家数据** —— 一人一份，随上线加载 / 下线销毁（本节）
+  * **赛事全局状态** —— 对战表、轮次进度、库存等，全局一份（见下方容灾）
+
+### 容灾 / 崩溃恢复（重点）
+游戏进程随时可能被 kill。重启后必须**尽量恢复到崩溃前的进度**，不能整场重来。
+- 用**文件快照**持久化（json 即可，不引数据库），存到可配置路径
+- 赛事全局状态都要落盘：当前状态机阶段、bracket 进度（每轮胜者）、
+  进行中单场的比分与出手、商店全场库存、结算是否已完成
+  （玩家个人数据走上面"玩家数据管理"的独立存盘，崩溃恢复时一并从各自文件加载）
+- 重启时从快照恢复，继续推进
+- **恢复必须满足**：
+  * 已结束的场次不重打、胜者不变
+  * 已发的积分 / 已发货 / 已退 梦幻币 **不重复发**（与发奖入口的幂等配合）
+  * 进行中的单场恢复到崩溃前比分，未超时的出手计时**从恢复点续算**（用时间源）
+  * 结算中途崩 → 重启后能补完且不重复退
+- 落盘时机：每个会改变结果的动作后（出手判定、晋级、发积分、购买、退款）都落一次
+
+---
+
+## 配置（config.py，测试可改）
 
 ```python
+# 时间线（可注入假时间源覆盖）
 TIMELINE = {
-    "login_open_ts": "2026-07-01 17:30:00",   # str
-    "start_ts":      "2026-07-01 18:00:00",   # str
-    "settle_ts":     "2026-07-03 00:00:00",   # str
+    "login_open_ts": "2026-07-01 17:30:00",
+    "start_ts":      "2026-07-01 18:00:00",
+    "settle_ts":     "2026-07-03 00:00:00",  # 07/02 24:00 = 07/03 00:00（用合法时间格式）
 }
-CLOCK = {"boot_ts": "2026-07-01 17:00:00"}    # str
-```
 
-而 `TimeSrc.set_time(target_ts: float)` / `advance(seconds: float)` 要求的是**数值时间戳(float)**。
+# 服务器时钟
+CLOCK = {
+    "boot_ts": "2026-07-01 17:00:00",  # 服务器启动时的初始时间（可被启动参数覆盖）
+}
 
-```python
-# ❌ 字符串直接运算 / 直接喂给 set_time —— 必报 TypeError: unsupported operand type(s) for -: 'str' and 'int'
-ts.set_time(TIMELINE["login_open_ts"] - 10)
-ts.set_time(TIMELINE["login_open_ts"])
+# 赛制
+MATCH = {
+    "move_timeout_sec": 60,
+    "score_per_win": 100,     # 每胜场分值
+}
 
-# ✅ 先转成时间戳。项目里已有现成转换函数,直接复用:
-from datetime import datetime
-def to_ts(s):  # 与 activity._parse_ts / server._parse_ts 一致
-    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
+# 商店
+SHOP_ITEMS = {
+    "banana": {"name": "香蕉", "price": 100, "per_user_limit": 1,    "stock": 10},
+    "apple":  {"name": "苹果", "price": 50,  "per_user_limit": 2,    "stock": 30},
+    "pear":   {"name": "雪梨", "price": 20,  "per_user_limit": None, "stock": None},  # None = 不限
+}
 
-ts.set_time(to_ts(TIMELINE["login_open_ts"]) - 10)
-```
+# 退款（剩余积分折算梦幻币）
+REFUND = {
+    "point_to_coin_ratio": 1.0,  # 1 积分 = 1 梦幻币
+}
 
-`TimeSrc.now()` 返回 `time.time() + _offset`,是 float。任何与时间相关的比较/加减都用 float。
+# 容灾 / 持久化
+PERSIST = {
+    "snapshot_path": "runtime/snapshot.json",  # 赛事全局状态快照
+    "player_data_dir": "runtime/players",      # 玩家数据目录（一人一文件）
+}
 
----
-
-## 3. 关键接口的返回值结构(最常被记错)
-
-### 3.1 `Activity.login / play / buy` 返回 **二元组 `(bool, payload)`**,不是 dict
-
-```python
-def login(self, player_id) -> tuple   # (ok: bool, payload: dict | str)
-def play(self, player_id, move) -> tuple   # (ok: bool, msg: str)
-def buy(self, player_id, item_id) -> tuple # (ok: bool, msg: str)
-```
-
-```python
-# ❌ 当成 dict 用 —— 必报 AttributeError: 'tuple' object has no attribute 'get'
-resp = act.login("player_01")
-assert resp.get("status") == "ok"
-
-# ✅ 先解包
-ok, payload = act.login("player_01")
-assert ok is True
-# 成功时 payload 是 dict:
-#   有进行中对局 -> {"event": "resync", "round":..., "opponent":..., ...}
-#   无进行中对局 -> {"event": "ok", "state": <当前状态>}
-# 失败时 payload 是 str(错误原因),如 "login not open yet" / "invalid player_id"
-```
-
-`query(player_id)` 是例外——它直接返回 dict:`{"state":..., "score":..., "current_round":...}`。
-
-### 3.2 socket 响应字段是 **`event`**,不是 `status`
-
-`server.Server._dispatch` 返回的 JSON 统一用 `event` 键,取值 `"ok"` / `"error"` / `"resync"`,外加 `msg`:
-
-```python
-# ❌ 断言不存在的 "status" 字段
-assert resp["status"] == "ok"
-# ✅
-assert resp["event"] in ("ok", "error", "resync")
+# 管理鉴权
+ADMIN = {
+    "token": "admin-secret-token",  # 管理指令（settime/advancetime）需携带此 token
+}
 ```
 
 ---
 
-## 4. 容器类型:`current_matches` 是 dict,迭代出的是 key(int)
+## 模块拆分（分文件，别堆一起）
+- `timesrc.py`     可注入的时间源
+- `config.py`      所有配置（时间线 / 分值 / 商店道具 / 退款比例）
+- `bracket.py`     对战表生成 + 晋级
+- `match.py`       单场 3 局两胜 + 出手 / 超时 / 平局判定
+- `activity.py`    状态机 + 时间驱动迁移
+- `score.py`       积分账户
+- `shop.py`        商店购买
+- `settlement.py`  退 梦幻币 结算（幂等）
+- `reward.py`      统一发奖入口（建单打印日志）
+- `player.py`     玩家内存对象 + 上线加载 / 下线销毁 / 数据存盘
+- `persist.py`     赛事全局状态快照落盘 / 恢复
+- `server.py`      服务端：监听 socket、会话管理、指令分发、赛事推进
+- `client.py`      客户端：单账号登录 + 收发指令（一个进程登录一个账号）
+- `admin.py`       管理脚本：带 token 发管理指令（settime / advancetime），如
+  `python admin.py settime "2026-07-01 18:00:00"`、`python admin.py advancetime 60`
 
-```python
-self.current_matches = {}   # dict: {match_index(int) -> Match}
-self.players = {}           # dict: {player_id(str) -> Player}  仅在线玩家
-self.logged_in = set()      # set: {player_id(str)}
-```
-
-```python
-# ❌ 把 current_matches 当成 Match 的可迭代集合 —— 报 AttributeError: 'int' object has no attribute 'finished'
-for m in act.current_matches:
-    if not m.finished: ...
-
-# ✅ dict 要取 .values() 才是 Match 对象
-for m in act.current_matches.values():
-    if not m.finished: ...
-# 或按 index 取: m = act.current_matches[0]
-```
-
-注意各轮对局数量:**第 1 轮有 16 场**(32/2),不是 1 场。别假设 `len(current_matches) == 1`。
-
----
-
-## 5. 状态机推进:进 SCORED 必须打完全部 5 轮 ⚠️
-
-状态严格单调前进:`NOT_STARTED → LOGIN_OPEN → RUNNING → SCORED → SETTLED`。各转移的**真实前置条件**:
-
-| 目标状态 | 触发方式 | 前置条件 |
-|---|---|---|
-| LOGIN_OPEN | `tick()` | `now >= login_open_ts` |
-| RUNNING | `tick()` | `now >= start_ts`(自动 `init_bracket` + 开始第 1 轮) |
-| SCORED | `play()` 或超时,使**第 5 轮(决赛)最后一场 Match 结束** | 必须逐轮打完 32→16→8→4→2→1 |
-| SETTLED | `tick()` | 当前是 SCORED 且 `now >= settle_ts` |
-
-```python
-# ❌ 以为打几局 / 推一次时间就能进 SCORED —— 实际仍是 RUNNING,断言失败
-ts.set_time(to_ts(TIMELINE["start_ts"])); act.tick()
-# ...打了两局...
-assert act.state == "SCORED"   # AssertionError: 'RUNNING' == 'SCORED'
-```
-
-**进入 SCORED 需要把整棵赛程打完**。猜拳判定规则:`rock>scissors`、`scissors>paper`、`paper>rock`;平局重出。让某方稳赢:其出 `rock`、对手出 `scissors`,重复 2 局即胜一场。完整推进需循环每一轮的每一场喂出手直到 `act.state` 变为 `SCORED`。**这是开销很大的集成剧本,断言状态前先确认确实驱动到位**(可用 `act.state` / `act.current_round` 实时检查,而不是假设)。
-
-如果只想测 SCORED/SETTLED 而不想真打完 5 轮,**优先用崩溃恢复路径构造**:手工写一份 `state="SCORED"` 的快照落盘,再新建 `Activity(ts)` 触发 `_try_restore` 恢复到该状态(见 §8)。
+### 通信协议（简单即可）
+- TCP socket，按行（`\n` 分隔）传 json
+- 客户端→服务端：`{"cmd": "login", "player_id": "player_07"}`、`{"cmd": "play", "move": "rock"}`、`{"cmd": "buy", "item": "apple"}`、`{"cmd": "query"}`
+- 管理/测试指令（**需 token 鉴权**）：`{"cmd": "settime", "ts": "...", "token": "..."}`、`{"cmd": "advancetime", "seconds": 60, "token": "..."}`
+  * token 必须与 `ADMIN.token` 匹配，否则拒绝（返回 error）
+  * 普通玩家客户端发管理指令一律拒（无 token / token 错）
+- 服务端→客户端：`{"event": "your_turn", ...}`、`{"event": "match_result", ...}`、`{"event": "ok"/"error", ...}`
+- 重连同步：客户端重新 `login` 后，服务端回推 `{"event": "resync", round, opponent, score, game_history, my_turn, time_left}`
+- move 取值：`rock` / `paper` / `scissors`
 
 ---
 
-## 6. 登录有状态前置:NOT_STARTED 下 login 必失败
-
-```python
-def login(self, player_id):
-    if player_id not in self.player_ids:      # 合法 id 为 "player_01".."player_32"
-        return False, "invalid player_id"
-    if self.state == self.STATE_NOT_STARTED:  # 未开放登录直接失败,不加入 logged_in
-        return False, "login not open yet"
-    ...
-```
-
-```python
-# ❌ 没把状态推到 LOGIN_OPEN 就 login,然后断言已登录 —— logged_in 仍为空集
-act = Activity(ts)            # 此刻 state=NOT_STARTED
-act.login("player_01")
-assert "player_01" in act.logged_in   # AssertionError: in set()
-
-# ✅ 先驱动到 LOGIN_OPEN(或 RUNNING)再 login
-ts.set_time(to_ts(TIMELINE["login_open_ts"])); act.tick()   # -> LOGIN_OPEN
-ok, _ = act.login("player_01")
-assert ok and "player_01" in act.logged_in
-```
-
-**合法 `player_id` 只有 32 个固定值,且必须是两位零填充字符串**:`"player_01"`、`"player_02"` …… `"player_09"`、`"player_10"` …… `"player_32"`。
-由 `activity.py` 中 `[f"player_{i:02d}" for i in range(1, 33)]` 生成,任何其它写法都会被 `login` 以 `"invalid player_id"` 拒绝,或在 `act.players[...]` / `bracket.slots` 里 KeyError。
-
-```python
-# ❌ 这些全是非法 id,过往真实跑挂:
-"p1", "p00", "tester", "alice", "e2e_player", "nonexistent", 1
-"player_0", "player_1", "player_5"        # 少一位零填充也非法! 必须 "player_01"/"player_05"
-# ✅ 唯一正确格式(两位零填充):
-"player_01", "player_05", "player_32"
-# 需要遍历全部玩家时,直接复用生成规则:
-player_ids = [f"player_{i:02d}" for i in range(1, 33)]
-```
+## 交付
+1. **服务端启动脚本**：一条命令起服务端（如 `python server.py`），监听端口、
+   按时间线自动推进赛事、崩溃重启能从快照恢复
+2. **客户端单账号登录脚本**：一条命令登录一个账号（如
+   `python client.py player_07`），完成登录、按提示出拳、可买道具、可查询
+   （要起 32 人就开 32 个客户端进程，那是测试方的事）
+3. `README`：怎么起服务端、怎么起客户端、配置含义、怎么模拟崩溃恢复
 
 ---
 
-## 7. `Match._pending_moves` 是惰性创建的,出手前不存在 ⚠️
-
-`_pending_moves` 用来暂存当局出手,**只在第一次调用 `_set_move`(即有人 `play`)时才被创建**,且**不写进 `to_dict()`**(已知设计:崩溃重建后丢失当局出手):
-
-```python
-def _set_move(self, player_id, move):
-    if not hasattr(self, "_pending_moves"):   # 惰性创建
-        self._pending_moves = {}
-    self._pending_moves[player_id] = move
-```
-
-```python
-# ❌ 出手前直接访问 —— 报 AttributeError: 'Match' object has no attribute '_pending_moves'
-m = Match(ts, 1, 0, 1, 2, "player_01", "player_02")
-assert m._pending_moves != {}
-
-# ✅ 正确姿势:
-#  - 想验证"出手被暂存": 先 m.start() 再 m.play(pid, move),然后用 getattr 兜底
-m.start(); m.play("player_01", "rock")
-assert getattr(m, "_pending_moves", {}).get("player_01") == "rock"
-#  - 想验证"序列化不含该字段(已知丢失 bug)": 断言它【不在】to_dict() 结果里
-assert "_pending_moves" not in m.to_dict()
-```
-
-`Match.to_dict()` 实际包含的字段:`round_num, match_index, slot_a, slot_b, player_a, player_b, wins, current_game, current_mover, move_deadline, game_history, finished, winner`。`Match.from_dict(d, timesrc)` 是 **classmethod**,需要传 `timesrc`。
+## 不要做的事
+- 不要数据库（容灾用 json 文件快照即可，不引 SQLite/Redis）
+- 不要密码校验（login 给 player_id 即算登录）
+- 不要日志框架，`print` 即可
+- 不要 Web 框架，裸 socket 即可
+- **不要自己写测试用例**（测试是后续 AI 的活，你别写）
 
 ---
 
-## 8. 故障注入 / 隔离上下文
-
-每个用例必须隔离持久化路径 + 重置三处模块级全局状态,否则测试间相互污染:
-
-```python
-import os, tempfile, shutil
-import config, persist, shop as shop_mod, settlement as settlement_mod
-
-class Env:
-    def __enter__(self):
-        self.tmp = tempfile.mkdtemp()
-        self._old = dict(config.PERSIST)
-        config.PERSIST["snapshot_path"]   = os.path.join(self.tmp, "snapshot.json")
-        config.PERSIST["player_data_dir"] = os.path.join(self.tmp, "players")
-        persist._snapshot = {}              # 模块级全局,必须重置
-        shop_mod.shop_stock = {}            # 模块级全局,必须重置
-        settlement_mod._settled = False     # 模块级全局,必须重置
-        return self
-    def __exit__(self, *a):
-        config.PERSIST.clear(); config.PERSIST.update(self._old)
-        shutil.rmtree(self.tmp, ignore_errors=True)
-```
-
-- **崩溃恢复**:驱动到某状态(会自动 `_save_full` 落盘)→ 丢弃 `act` → 新建 `Activity(ts)`,构造时自动调 `_try_restore` 从快照恢复 → 断言恢复后的 `state / current_round / bracket / shop_stock / settlement` 与崩溃前一致。`_pending_moves` 除外(必然丢失)。
-
-### 8.1 手写快照注入:必须严格按各 section 的真实结构 ⚠️
-
-"手写快照再 `Activity(ts)` 恢复"是构造 SCORED/SETTLED 的省力捷径,但 `_try_restore` 会把每个 section 喂给对应模块的 `from_dict`,**结构写错会在构造 `Activity` 时就崩**(过往真实失败:`KeyError: 'stock'`、`'list' object has no attribute 'items'`)。
-
-每个 section 的**精确结构**(用 `persist.save_snapshot(section, data)` 逐段写入):
-
-| section | 类型 | 结构 / 示例 | 易错点 |
-|---|---|---|---|
-| `"state"` | str | `"SCORED"` | 必须是合法状态名,无 `"INIT"` |
-| `"logged_in"` | list[str] | `["player_01", "player_02"]` | 是 list 不是 set |
-| `"current_round"` | int | `5` | |
-| `"bracket"` | dict | `{"slots": {"1": "player_07", ...}, "round_winners": {"1": {"0": 3, ...}}}` | `slots`/`round_winners` 都是 **dict**(JSON key 为字符串);**不是 list**。`slots` 必须 32 项 |
-| `"shop"` | dict | `{"stock": {"banana": 10, "apple": 30, "pear": null}}` | 外层必须包一层 `{"stock": {...}}`,不能直接 `{"banana":10}` |
-| `"settlement"` | dict | `{"settled": false}` | key 是 `"settled"` |
-| `"matches"` | dict | `{"0": <Match.to_dict()>, ...}` | key 是字符串化的 match_index;空可填 `{}` |
-
-```python
-# ✅ 构造一个 SCORED 状态(空对局、商店满库存)的最小快照:
-import persist
-def inject_scored_snapshot(player_ids):
-    persist.save_snapshot("state", "SCORED")
-    persist.save_snapshot("logged_in", [])
-    persist.save_snapshot("current_round", 5)
-    persist.save_snapshot("bracket", {
-        "slots": {str(i + 1): player_ids[i] for i in range(32)},  # 32 项, key 为字符串
-        "round_winners": {},
-    })
-    persist.save_snapshot("shop", {"stock": {"banana": 10, "apple": 30, "pear": None}})
-    persist.save_snapshot("settlement", {"settled": False})
-    persist.save_snapshot("matches", {})
-# 之后 act = Activity(ts) 会自动 _try_restore 到 SCORED
-```
-
-> 注:`_try_restore` 末尾会调一次 `_tick()`。若注入 SCORED 且 `now >= settle_ts`,会立刻迁到 SETTLED。要停在 SCORED,先 `ts.set_time(to_ts(TIMELINE["start_ts"]))`(早于 settle_ts)。
-> **更稳的替代**:如果只是想验证某接口在 SCORED 下的行为,优先考虑用端到端(socket)流程或真实驱动,手写快照容易与内部结构耦合出错。
-
----
-
-## 9. E2E(socket)用例:端口写死 9999,不要换端口 ⚠️
-
-`server.py` **端口硬编码为 9999**,且从 `sys.argv[1]` 读 `boot_ts`(日期字符串)。它没有提供改端口的入口。**端到端(socket)是本项目的回归主力**:它跨真实进程与协议、最接近线上,且不依赖任何内部结构约定(快照/容器/状态名),鲁棒性最高。请优先把协议类(protocol)与关键业务路径用 e2e 覆盖。
-
-**核心纪律:全程只用一个 server 进程,固定 9999,所有 e2e 用例共享它。** 端口写死无法并行,**每个用例各起一个 server 会互相抢 9999**,导致后启的连不上(`ConnectionRefused`)或前一个残留把连接踢掉(`ConnectionReset`)——这正是过往 4 个 e2e 全挂的根因。正确做法是用一个 **module 级 fixture** 起一次、跑完所有 e2e 再关:
-
-```python
-# ✅ 放进 imports: 整个测试模块共享同一个 server,杜绝端口争用
-import subprocess, socket, json, time, sys, pytest
-PORT = 9999
-
-def _wait_port(timeout=10.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            s = socket.create_connection(("127.0.0.1", PORT), timeout=0.3); s.close(); return True
-        except OSError:
-            time.sleep(0.1)
-    return False
-
-@pytest.fixture(scope="module")
-def server():
-    # cwd 默认就是被测项目根(stage5 已设),server.py 用相对路径 runtime/
-    p = subprocess.Popen([sys.executable, "server.py", "2026-07-01 17:00:00"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    assert _wait_port(), "server 未在 10s 内就绪"
-    yield p
-    p.terminate()
-    try: p.wait(timeout=5)
-    except Exception: p.kill()
-
-def send_cmd(obj):
-    """每条指令用一个短连接发送并读一行响应。失败原因也在 event 字段里,不要假设连接保持。"""
-    s = socket.create_connection(("127.0.0.1", PORT), timeout=3)
-    try:
-        s.sendall((json.dumps(obj) + "\n").encode())
-        buf = b""
-        while b"\n" not in buf:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-        return json.loads(buf.split(b"\n")[0].decode())
-    finally:
-        s.close()
-
-# 每个 e2e 用例都把 server 作为参数注入(触发共享 fixture),不要自起进程:
-def test_e2e_query_returns_dict(server):
-    resp = send_cmd({"cmd": "query", "player_id": "player_01"})
-    assert isinstance(resp, dict) and "event" in resp or "state" in resp
-```
-
-> 注意:e2e 用例之间共享同一个 server 进程 = **共享同一份活动状态**(时间、登录、对局)。用例顺序会相互影响,设计时要么让每个用例自洽(用 `settime` 把时间推到所需阶段),要么不依赖其它用例的残留状态。这是真实进程级测试的固有代价,换来的是最接近线上的可信度。
-
-socket 指令格式(每行一条 JSON):
-- `{"cmd":"login","player_id":"player_01"}`
-- `{"cmd":"play","player_id":"player_01","move":"rock"}`
-- `{"cmd":"buy","player_id":"player_01","item":"apple"}`
-- `{"cmd":"query","player_id":"player_01"}`
-- `{"cmd":"settime","ts":"2026-07-01 18:00:00","token":"admin-secret-token"}`(管理指令,`ts` 是**日期字符串**)
-- `{"cmd":"advancetime","seconds":3600,"token":"admin-secret-token"}`
-
-管理指令(`settime`/`advancetime`)必须带正确 `token`(见 `config.ADMIN["token"]` = `"admin-secret-token"`);token 错误返回 `{"event":"error","msg":"unauthorized"}` 且不改时间/状态。
-
----
-
-## 10. 各模块接口签名速查(以此为准)
-
-> 标注 `(self,...)` 的是**实例方法**:必须先构造实例再调,如 `Player("player_01").load()`,**不能** `Player.load("player_01")`。
-> 标注 `@classmethod` 的可直接 `Cls.method(...)`。其余为模块级函数。
-
-```text
-[config]  常量(无函数): TIMELINE/CLOCK(时间字段均为 str), MATCH, SHOP_ITEMS, REFUND, PERSIST, ADMIN
-
-[timesrc] class TimeSrc:
-    __init__(self)                 # 不带时间参数,初始 offset=0
-    now(self) -> float
-    set_time(self, target_ts: float)   # 参数是 float 时间戳,不是字符串
-    advance(self, seconds: float)
-
-[player]  class Player:
-    __init__(self, player_id)      # player_id 形如 "player_01"
-    load(self)                     # 实例方法! 从盘加载;文件不存在则创建。无返回值
-    save(self)
-    add_win(self)
-    record_buy(self, item_id, count)
-    get_buy_count(self, item_id) -> int
-    deduct_score(self, amount) -> bool   # 余额不足返回 False,不扣
-    to_dict(self) -> dict
-    # 字段: score, coins, buys(dict), rewards(list), wins
-
-[match]   class Match:
-    __init__(self, timesrc, round_num, match_index, slot_a, slot_b, player_a, player_b)
-    start(self)
-    play(self, player_id, move) -> (bool, str)   # move ∈ {"rock","paper","scissors"}
-    check_timeout(self) -> bool
-    get_state_for_player(self, player_id) -> dict
-    to_dict(self) -> dict
-    from_dict(cls, d, timesrc) -> Match          # @classmethod, 需传 timesrc
-    # _pending_moves 惰性创建、不序列化(见 §7)
-
-[bracket] class Bracket:
-    __init__(self)
-    init_bracket(self, player_ids, seed=None)
-    get_matchups(self, round_num) -> list[tuple]   # [(slot_a, slot_b, player_a, player_b), ...]
-    record_winner(self, round_num, match_index, winner_slot)
-    get_champion_slot(self) -> int | None
-    get_champion(self) -> str | None
-    get_player_wins(self, player_id) -> int
-    to_dict(self) -> dict
-    from_dict(cls, d) -> Bracket                   # @classmethod
-
-[shop]    模块级函数 + 模块级全局 shop_stock(dict, 测试间必须重置):
-    init_shop()                                    # 按 SHOP_ITEMS 重填库存
-    buy(player_id, item_id, timesrc, player) -> (bool, str)   # 注意参数顺序与类型
-    to_dict() -> dict        # {"stock": {...}}
-    from_dict(d)
-
-[settlement] 模块级函数 + 模块级全局 _settled(bool, 测试间必须重置):
-    is_settled() -> bool
-    to_dict() -> dict        # {"settled": bool}
-    from_dict(d)
-
-[persist] 模块级函数 + 模块级全局 _snapshot(dict, 测试间必须重置):
-    save_snapshot(section, data)        # 注意是 (section_name, data) 两个参数
-    load_snapshot() -> dict             # 无参数; 读盘并返回整个快照 dict
-    get_snapshot_section(section) -> any
-    # 没有名为 load() 的函数,不要调用 persist.load(...)
-
-[reward]  模块级函数:
-    reward(player_id, rtype, amount, ts, player=None)
-    # rtype="SCORE" 加 score; rtype="梦幻币" 加 coins; 其它视为道具只记录
-
-[activity] class Activity:
-    __init__(self, timesrc)            # 构造时自动 init_shop + _try_restore
-    login(self, player_id) -> (bool, dict|str)     # 见 §3.1
-    logout(self, player_id)
-    query(self, player_id) -> dict                 # 直接返回 dict
-    play(self, player_id, move) -> (bool, str)
-    buy(self, player_id, item_id) -> (bool, str)
-    tick(self)                                      # 推进状态机
-    # 字段: state(str), players(dict), logged_in(set),
-    #       bracket(Bracket), current_round(int), current_matches(dict{int:Match})
-    # 状态常量: STATE_NOT_STARTED/LOGIN_OPEN/RUNNING/SCORED/SETTLED
-
-[server]  class Server:
-    __init__(self, host="0.0.0.0", port=9999, boot_ts_str=None)
-    start(self)                        # 阻塞监听; 测试用 subprocess 起,固定端口 9999
-    # 响应 JSON 用 "event" 键(见 §3.2),不是 "status"
-```
-
----
-
-## 11. 已知设计缺陷(测试时按"已知行为"对待,别误判为可修复 bug)
-
-- `Match._pending_moves` 不持久化:崩溃重建后当局出手丢失(§7)。
-- `settlement._settled = True` 先于 `_save_full` 落盘:崩溃重建可重复结算发币(资金安全窗口)。
-- `shop.buy` 扣分与减库存之间无原子保证:中途崩溃可能积分已扣但库存未减。
-
-测试这些不变式时,应**断言系统是否有保护**,而非假设字段一定存在或一定被恢复。
-
----
-
-## 12. 生成用例前的自检清单
-
-1. 时间字段先经 `to_ts()` 转 float 了吗?没有直接拿 `TIMELINE[...]` 做减法?
-2. `login/play/buy` 的返回值解包成 `(ok, payload)` 了吗?没有对元组调 `.get()`?
-3. 遍历 `current_matches` 用了 `.values()` 吗?没有把 int 当 Match?
-4. 断言状态前确实驱动到位了吗?状态名只用 `NOT_STARTED/LOGIN_OPEN/RUNNING/SCORED/SETTLED` 五个,**没有 `INIT`**?
-5. `login` 前状态已是 LOGIN_OPEN/RUNNING 吗?`player_id` 是两位零填充的 `"player_01"`(不是 `"player_1"`/`"p1"`/`"alice"`)吗?
-6. 访问 `_pending_moves` 前已 `play` 过、或用了 `getattr` 兜底吗?
-7. **手写快照注入**时,每个 section 结构对吗?`shop` 包了 `{"stock":{...}}`、`bracket.slots` 是 32 项 dict(非 list)?(见 §8.1)
-8. **E2E 用例共享同一个 module 级 server fixture** 吗?没有每个用例各起一个 server 抢 9999?管理指令带 token、`ts` 是日期字符串吗?
-9. 实例方法(如 `Player.load`)先构造实例再调了吗?
-10. 每个进程内用例都进了 `Env` 隔离上下文、重置了三处全局状态吗?
+## 三条命脉（验收必查）
+1. **可注入时间源**：否则没法测开关瞬间、出手超时、07/02 24:00 结算那一刻
+2. **统一发奖入口**：否则发奖散落各处，资源守恒无法审计
+   （金标准断言：全场发放积分 = 3100；每人积分 = 商店消耗 + 退 梦幻币）
+3. **快照可恢复且幂等**：崩溃重启后进度不丢、奖励不重发、已结束场次不重打
