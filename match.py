@@ -158,7 +158,7 @@ class Match:
         }
 
     def _set_move(self, player_id, move):
-        # 用未持久化的 dict 暂存
+        # 用 dict 暂存(已在 to_dict 持久化,见 BUG-4)
         if not hasattr(self, "_pending_moves"):
             self._pending_moves = {}
         self._pending_moves[player_id] = move
@@ -172,6 +172,9 @@ class Match:
         self._pending_moves = {}
 
     def to_dict(self):
+        # _pending_moves 纳入持久化(BUG-4):崩溃后未结算的出手不再丢失
+        if not hasattr(self, "_pending_moves"):
+            self._pending_moves = {}
         return {
             "round_num": self.round_num,
             "match_index": self.match_index,
@@ -186,6 +189,7 @@ class Match:
             "game_history": self.game_history,
             "finished": self.finished,
             "winner": self.winner,
+            "pending_moves": dict(self._pending_moves),
         }
 
     @classmethod
@@ -206,4 +210,6 @@ class Match:
         m.game_history = d["game_history"]
         m.finished = d["finished"]
         m.winner = d["winner"]
+        # 恢复未结算出手(BUG-4)
+        m._pending_moves = dict(d.get("pending_moves") or {})
         return m

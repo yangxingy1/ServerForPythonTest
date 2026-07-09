@@ -1,4 +1,5 @@
 from datetime import datetime
+import threading
 
 from config import TIMELINE, MATCH, ADMIN, REFUND
 from timesrc import TimeSrc
@@ -26,6 +27,9 @@ class Activity:
 
     def __init__(self, timesrc):
         self.timesrc = timesrc
+        # 赛事状态锁:串行化对 current_matches 的迭代/增删与状态机迁移,
+        # 消除并发 tick()/play() 的 "dictionary changed size during iteration"(BUG-8)。
+        self._lock = threading.RLock()
         self.state = self.STATE_NOT_STARTED
         self.player_ids = [f"player_{i:02d}" for i in range(1, 33)]
         self.players = {}  # player_id -> Player（仅在线）
@@ -94,60 +98,72 @@ class Activity:
         persist.save_snapshot("matches", {str(k): v.to_dict() for k, v in self.current_matches.items()})
 
     def login(self, player_id):
-        if player_id not in self.player_ids:
-            return False, "invalid player_id"
-        if self.state == self.STATE_NOT_STARTED:
-            return False, "login not open yet"
-        self._player_load(player_id)
-        self.logged_in.add(player_id)
-        self._save_full()
+        with self._lock:
+            if player_id not in self.player_ids:
+                return False, "invalid player_id"
+            if self.state == self.STATE_NOT_STARTED:
+                return False, "login not open yet"
+            self._player_load(player_id)
+            self.logged_in.add(player_id)
+            self._save_full()
 
-        for mi, m in self.current_matches.items():
-            if player_id in (m.player_a, m.player_b) and not m.finished:
-                state = m.get_state_for_player(player_id)
-                return True, {"event": "resync", **state}
+            for mi, m in list(self.current_matches.items()):
+                if player_id in (m.player_a, m.player_b) and not m.finished:
+                    state = m.get_state_for_player(player_id)
+                    return True, {"event": "resync", **state}
 
-        return True, {"event": "ok", "state": self.state}
+            return True, {"event": "ok", "state": self.state}
 
     def logout(self, player_id):
-        self.logged_in.discard(player_id)
-        self._player_unload(player_id)
+        with self._lock:
+            self.logged_in.discard(player_id)
+            self._player_unload(player_id)
 
     def query(self, player_id):
-        p = self._player_online(player_id)
-        return {
-            "state": self.state,
-            "score": p.score if p else 0,
-            "current_round": self.current_round,
-        }
+        with self._lock:
+            p = self._player_online(player_id)
+            if p is not None:
+                score = p.score
+            else:
+                # 离线时从盘加载真实积分返回(BUG-6),不再恒为 0。
+                offline_p = Player(player_id)
+                offline_p.load()
+                score = offline_p.score
+            return {
+                "state": self.state,
+                "score": score,
+                "current_round": self.current_round,
+            }
 
     def play(self, player_id, move):
-        if self.state != self.STATE_RUNNING:
-            return False, "match not running"
-        if move not in ("rock", "paper", "scissors"):
-            return False, "invalid move"
-        for mi, m in self.current_matches.items():
-            if player_id in (m.player_a, m.player_b) and not m.finished:
-                ok, msg = m.play(player_id, move)
-                if ok:
-                    self._save_full()
-                    if m.finished:
-                        self._on_match_finished(mi, m)
-                return ok, msg
-        return False, "no active match"
+        with self._lock:
+            if self.state != self.STATE_RUNNING:
+                return False, "match not running"
+            if move not in ("rock", "paper", "scissors"):
+                return False, "invalid move"
+            for mi, m in list(self.current_matches.items()):
+                if player_id in (m.player_a, m.player_b) and not m.finished:
+                    ok, msg = m.play(player_id, move)
+                    if ok:
+                        self._save_full()
+                        if m.finished:
+                            self._on_match_finished(mi, m)
+                    return ok, msg
+            return False, "no active match"
 
     def buy(self, player_id, item_id):
-        if self.state != self.STATE_SCORED:
-            return False, "shop not open"
-        if settlement_mod.is_settled():
-            return False, "already settled"
-        p = self._player_online(player_id)
-        if not p:
-            return False, "not online"
-        ok, msg = shop_mod.buy(player_id, item_id, self.timesrc, p)
-        if ok:
-            self._save_full()
-        return ok, msg
+        with self._lock:
+            if self.state != self.STATE_SCORED:
+                return False, "shop not open"
+            if settlement_mod.is_settled():
+                return False, "already settled"
+            p = self._player_online(player_id)
+            if not p:
+                return False, "not online"
+            ok, msg = shop_mod.buy(player_id, item_id, self.timesrc, p)
+            if ok:
+                self._save_full()
+            return ok, msg
 
     def _on_match_finished(self, match_index, match):
         winner_slot = match.slot_a if match.winner == match.player_a else match.slot_b
@@ -156,7 +172,7 @@ class Activity:
         p = self._player_online(match.winner)
         if p:
             p.add_win()
-        del self.current_matches[match_index]
+        self.current_matches.pop(match_index, None)
         self._save_full()
 
         if not self.current_matches:
@@ -206,6 +222,7 @@ class Activity:
             self._save_full()
 
         if self.state == self.STATE_RUNNING:
+            # 迭代字典用快照,避免与 play()/_on_match_finished 的增删并发(BUG-8)。
             for mi, m in list(self.current_matches.items()):
                 if m.check_timeout():
                     self._save_full()
@@ -218,22 +235,31 @@ class Activity:
             self._save_full()
 
     def _settle_all(self):
+        # 幂等:若上次已全部退完(_settled 为真),直接返回。
         if settlement_mod.is_settled():
             return
-        settlement_mod._settled = True
+        # 先逐人退币,记录已退玩家;全部退完后再置 _settled(BUG-2)。
+        # 中途崩溃:已退玩家在 _refunded 集合里(幂等不重发),未退玩家重启后补退。
         for player_id in self.player_ids:
+            if settlement_mod.is_refunded(player_id):
+                continue
             player = self._player_online(player_id)
-            if player and player.score > 0:
+            if player is None:
+                offline_p = Player(player_id)
+                offline_p.load()
+                player = offline_p
+            if player.score > 0:
                 coin = player.score * REFUND["point_to_coin_ratio"]
                 player.deduct_score(player.score)
                 reward(player_id, "梦幻币", coin, self.timesrc.now(), player)
-            elif not player:
-                offline_p = Player(player_id)
-                offline_p.load()
-                if offline_p.score > 0:
-                    coin = offline_p.score * REFUND["point_to_coin_ratio"]
-                    offline_p.deduct_score(offline_p.score)
-                    reward(player_id, "梦幻币", coin, self.timesrc.now(), offline_p)
+            # 该玩家退币完成,立即落盘 refunded 集合,与玩家数据同步推进
+            # (保证崩溃后补退集合与已退玩家一致,不漏退也不重退)。
+            settlement_mod.mark_refunded(player_id)
+            persist.save_snapshot("settlement", settlement_mod.to_dict())
+        # 全部应退玩家都已处理完,标记结算完成。
+        settlement_mod.mark_settled()
+        persist.save_snapshot("settlement", settlement_mod.to_dict())
 
     def tick(self):
-        self._tick()
+        with self._lock:
+            self._tick()

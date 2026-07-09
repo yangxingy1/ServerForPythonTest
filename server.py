@@ -96,7 +96,11 @@ class Server:
             ok, payload = self.activity.login(player_id)
             if ok:
                 self.sessions[player_id] = conn
-            return payload
+                return payload
+            else:
+                # login 失败也包成 error dict,保证响应统一为 {event:...}(BUG-5)。
+                # payload 此处为错误信息字符串。
+                return {"event": "error", "msg": payload}
         elif cmd == "query":
             return self.activity.query(req.get("player_id", ""))
         elif cmd == "play":
