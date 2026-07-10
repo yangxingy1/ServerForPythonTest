@@ -137,7 +137,7 @@ class Activity:
                 return False, "invalid player_id"
             if self.state == self.STATE_NOT_STARTED:
                 return False, "login not open yet"
-            self._player_load(player_id)
+            p = self._player_load(player_id)
             self.logged_in.add(player_id)
             self._save_full()
 

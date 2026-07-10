@@ -38,17 +38,27 @@ def buy(player_id, item_id, timesrc, player):
             return False, "deduct failed"
 
         stock_decremented = False
+        bought_recorded = False
         try:
             if stock is not None:
                 shop_stock[item_id] -= 1
                 stock_decremented = True
 
             player.record_buy(item_id, 1)
+            bought_recorded = True
             reward(player_id, cfg["name"], 1, timesrc.now(), player)
         except Exception:
             # 回滚已发生的改动,使整笔购买要么全成要么全不成。
             if stock_decremented:
                 shop_stock[item_id] += 1
+            # 撤销 record_buy 已计入的限购计数(BUG-10: 之前遗漏此回滚,
+            # 导致异常后限购额度被占用但物品未发货)。
+            if bought_recorded:
+                remaining = player.buys.get(item_id, 0) - 1
+                if remaining <= 0:
+                    player.buys.pop(item_id, None)
+                else:
+                    player.buys[item_id] = remaining
             # 把扣掉的积分加回来(走统一入口,会落盘)。
             player.score += price
             player.save()
