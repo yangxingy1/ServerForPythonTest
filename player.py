@@ -4,8 +4,6 @@ import threading
 from config import PERSIST
 
 
-# 玩家级文件锁:每个 player_id 一把锁,串行化同名玩家文件的并发读写,
-# 避免并发 login(读)/logout(写)读到写入中途的截断内容(BUG-9)。
 _player_locks_guard = threading.Lock()
 _player_locks = {}
 
@@ -50,7 +48,6 @@ class Player:
             self.rewards = d.get("rewards", [])
             self.wins = d.get("wins", 0)
 
-    # 原子写入:先写临时文件再 os.replace 重命名,避免并发读到半写内容(BUG-9)
     def _write_atomic(self):
         path = _player_path(self.player_id)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -82,6 +79,8 @@ class Player:
         return self.buys.get(item_id, 0)
 
     def deduct_score(self, amount):
+        if amount < 0:
+            return False
         if self.score < amount:
             return False
         self.score -= amount

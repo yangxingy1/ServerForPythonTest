@@ -1,9 +1,6 @@
 # 结算状态 : bool
 _settled = False
 
-# 已退梦幻币的玩家集合(仅当 _settled 为真时才有意义)。
-# 配合 _settle_all 做崩溃补退:已退的不重发(幂等),未退的可补退。
-# 只有全部应退玩家都退完后才把 _settled 置真(BUG-2)。
 _refunded = set()
 
 

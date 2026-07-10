@@ -143,8 +143,7 @@ class Match:
         remaining = self.move_deadline - self.timesrc.now()
         return max(0, remaining)
 
-    def get_state_for_player(self, player_id):
-        """重连同步用"""
+    def get_state_for_player(self, player_id, score=None):
         opponent = self.player_b if player_id == self.player_a else self.player_a
         my_turn = (self.current_mover == "both")
         return {
@@ -152,13 +151,13 @@ class Match:
             "opponent": opponent,
             "my_wins": self.wins.get(player_id, 0),
             "opponent_wins": self.wins.get(opponent, 0),
+            "score": score,
             "game_history": self.game_history,
             "my_turn": my_turn,
             "time_left": self.get_time_left(player_id) if my_turn else None,
         }
 
     def _set_move(self, player_id, move):
-        # 用 dict 暂存(已在 to_dict 持久化,见 BUG-4)
         if not hasattr(self, "_pending_moves"):
             self._pending_moves = {}
         self._pending_moves[player_id] = move
@@ -172,7 +171,6 @@ class Match:
         self._pending_moves = {}
 
     def to_dict(self):
-        # _pending_moves 纳入持久化(BUG-4):崩溃后未结算的出手不再丢失
         if not hasattr(self, "_pending_moves"):
             self._pending_moves = {}
         return {
@@ -210,6 +208,5 @@ class Match:
         m.game_history = d["game_history"]
         m.finished = d["finished"]
         m.winner = d["winner"]
-        # 恢复未结算出手(BUG-4)
         m._pending_moves = dict(d.get("pending_moves") or {})
         return m

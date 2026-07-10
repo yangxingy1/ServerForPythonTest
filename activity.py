@@ -27,8 +27,6 @@ class Activity:
 
     def __init__(self, timesrc):
         self.timesrc = timesrc
-        # 赛事状态锁:串行化对 current_matches 的迭代/增删与状态机迁移,
-        # 消除并发 tick()/play() 的 "dictionary changed size during iteration"(BUG-8)。
         self._lock = threading.RLock()
         self.state = self.STATE_NOT_STARTED
         self.player_ids = [f"player_{i:02d}" for i in range(1, 33)]
@@ -37,6 +35,7 @@ class Activity:
         self.bracket = Bracket()
         self.current_round = 0
         self.current_matches = {}
+        self._notify = None
         self._timeline_ts = {
             "login_open": _parse_ts(TIMELINE["login_open_ts"]),
             "start": _parse_ts(TIMELINE["start_ts"]),
@@ -45,12 +44,47 @@ class Activity:
         shop_mod.init_shop()
         self._try_restore()
 
+    def set_notifier(self, fn):
+        self._notify = fn
+
+    def _push(self, player_id, event):
+        if self._notify is None:
+            return
+        try:
+            self._notify(player_id, event)
+        except Exception as e:
+            print(f"[ACTIVITY] notify failed for {player_id}: {e}")
+
+    def _build_turn_event(self, match, player_id):
+        return {
+            "event": "your_turn",
+            "round": match.round_num,
+            "opponent": match.player_b if player_id == match.player_a else match.player_a,
+            "my_turn": match.current_mover == "both",
+            "time_left": match.get_time_left(player_id),
+        }
+
+    def _build_match_result_event(self, match, player_id):
+        opponent = match.player_b if player_id == match.player_a else match.player_a
+        won = (match.winner == player_id)
+        return {
+            "event": "match_result",
+            "round": match.round_num,
+            "opponent": opponent,
+            "winner": match.winner,
+            "won": won,
+            "my_wins": match.wins.get(player_id, 0),
+            "opponent_wins": match.wins.get(opponent, 0),
+        }
+
+    def _notify_turn_both(self, match):
+        self._push(match.player_a, self._build_turn_event(match, match.player_a))
+        self._push(match.player_b, self._build_turn_event(match, match.player_b))
+
     def _player_online(self, player_id):
-        """返回内存中的玩家对象。上线后才存在。"""
         return self.players.get(player_id)
 
     def _player_load(self, player_id):
-        """从盘加载（上线用）"""
         if player_id in self.players:
             return self.players[player_id]
         p = Player(player_id)
@@ -109,7 +143,7 @@ class Activity:
 
             for mi, m in list(self.current_matches.items()):
                 if player_id in (m.player_a, m.player_b) and not m.finished:
-                    state = m.get_state_for_player(player_id)
+                    state = m.get_state_for_player(player_id, score=p.score)
                     return True, {"event": "resync", **state}
 
             return True, {"event": "ok", "state": self.state}
@@ -125,7 +159,6 @@ class Activity:
             if p is not None:
                 score = p.score
             else:
-                # 离线时从盘加载真实积分返回(BUG-6),不再恒为 0。
                 offline_p = Player(player_id)
                 offline_p.load()
                 score = offline_p.score
@@ -143,11 +176,15 @@ class Activity:
                 return False, "invalid move"
             for mi, m in list(self.current_matches.items()):
                 if player_id in (m.player_a, m.player_b) and not m.finished:
+                    games_before = len(m.game_history)
                     ok, msg = m.play(player_id, move)
                     if ok:
                         self._save_full()
                         if m.finished:
                             self._on_match_finished(mi, m)
+                        elif len(m.game_history) > games_before:
+                            # 本手结算了一局且比赛未结束 -> 新局开始,提醒双方出手。
+                            self._notify_turn_both(m)
                     return ok, msg
             return False, "no active match"
 
@@ -172,6 +209,8 @@ class Activity:
         p = self._player_online(match.winner)
         if p:
             p.add_win()
+        self._push(match.player_a, self._build_match_result_event(match, match.player_a))
+        self._push(match.player_b, self._build_match_result_event(match, match.player_b))
         self.current_matches.pop(match_index, None)
         self._save_full()
 
@@ -206,6 +245,8 @@ class Activity:
         for m in self.current_matches.values():
             m.start()
         self._save_full()
+        for m in self.current_matches.values():
+            self._notify_turn_both(m)
 
     def _tick(self):
         now = self.timesrc.now()
@@ -222,12 +263,14 @@ class Activity:
             self._save_full()
 
         if self.state == self.STATE_RUNNING:
-            # 迭代字典用快照,避免与 play()/_on_match_finished 的增删并发(BUG-8)。
             for mi, m in list(self.current_matches.items()):
+                games_before = len(m.game_history)
                 if m.check_timeout():
                     self._save_full()
                     if m.finished:
                         self._on_match_finished(mi, m)
+                    elif len(m.game_history) > games_before:
+                        self._notify_turn_both(m)
 
         if self.state == self.STATE_SCORED and now >= self._timeline_ts["settle"]:
             self._settle_all()
@@ -238,8 +281,6 @@ class Activity:
         # 幂等:若上次已全部退完(_settled 为真),直接返回。
         if settlement_mod.is_settled():
             return
-        # 先逐人退币,记录已退玩家;全部退完后再置 _settled(BUG-2)。
-        # 中途崩溃:已退玩家在 _refunded 集合里(幂等不重发),未退玩家重启后补退。
         for player_id in self.player_ids:
             if settlement_mod.is_refunded(player_id):
                 continue

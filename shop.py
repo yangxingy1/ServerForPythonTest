@@ -5,9 +5,6 @@ from reward import reward
 
 # 商品id -> 剩余量
 shop_stock = {}
-
-# 全局商店锁:串行化 check(库存/限购/积分)与扣减/发货,消除 TOCTOU
-# 超卖(BUG-7)、per_user_limit 绕过(BUG-7b)与半提交(BUG-3)。
 _shop_lock = threading.Lock()
 
 
@@ -18,7 +15,6 @@ def init_shop():
 
 
 def buy(player_id, item_id, timesrc, player):
-    # 整个 check-then-set 在锁内原子完成(BUG-7/7b/3)。
     with _shop_lock:
         if item_id not in SHOP_ITEMS:
             return False, "item not found"
@@ -38,11 +34,9 @@ def buy(player_id, item_id, timesrc, player):
             if bought >= limit:
                 return False, "per user limit reached"
 
-        # 所有前置校验通过后再扣分(BUG-3:扣分若失败直接返回,不改库存/限购)。
         if not player.deduct_score(price):
             return False, "deduct failed"
 
-        # 扣分成功后,后续步骤任一异常都要回滚积分,保证不留半提交状态(BUG-3)。
         stock_decremented = False
         try:
             if stock is not None:

@@ -19,9 +19,11 @@ class Server:
         boot_ts_str = boot_ts_str or CLOCK["boot_ts"]
         self.timesrc.set_time(_parse_ts(boot_ts_str))
         self.activity = Activity(self.timesrc)
+        self.activity.set_notifier(self._notify_player)
         self.host = host
         self.port = port
         self.sessions = {}  # player_id -> socket
+        self._sessions_lock = threading.Lock()
 
     def start(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -51,10 +53,9 @@ class Server:
                     except Exception:
                         self._send(conn, {"event": "error", "msg": "invalid json"})
                         continue
-                    resp = self._dispatch(req, conn)
+                    resp = self._dispatch(req, conn, player_id)
                     if resp:
                         self._send(conn, resp)
-                    # 记录 login 的 player_id 用于退出时 logout
                     if req.get("cmd") == "login":
                         player_id = req.get("player_id", "")
         except Exception as e:
@@ -62,10 +63,35 @@ class Server:
         finally:
             if player_id:
                 self.activity.logout(player_id)
-                self.sessions.pop(player_id, None)
+                self._unregister_session(player_id, conn)
             conn.close()
 
-    def _dispatch(self, req, conn):
+    def _register_session(self, player_id, conn):
+        with self._sessions_lock:
+            self.sessions[player_id] = conn
+
+    def _unregister_session(self, player_id, conn):
+        with self._sessions_lock:
+            # 仅当仍是本连接占位时才移除,避免被后一次 login 的连接误删(重连竞态)。
+            if self.sessions.get(player_id) is conn:
+                self.sessions.pop(player_id, None)
+
+    def _notify_player(self, player_id, event):
+        with self._sessions_lock:
+            conn = self.sessions.get(player_id)
+        if conn is not None:
+            self._send(conn, event)
+
+    def _player_id_for(self, req, conn, fallback_pid):
+        player_id = req.get("player_id")
+        if player_id:
+            return player_id
+        # 指令未带 player_id:用本连接已 login 的玩家。
+        if fallback_pid:
+            return fallback_pid
+        return ""
+
+    def _dispatch(self, req, conn, fallback_pid=None):
         cmd = req.get("cmd")
 
         # 管理指令需 token 鉴权
@@ -95,16 +121,15 @@ class Server:
             player_id = req.get("player_id", "")
             ok, payload = self.activity.login(player_id)
             if ok:
-                self.sessions[player_id] = conn
+                self._register_session(player_id, conn)
                 return payload
             else:
-                # login 失败也包成 error dict,保证响应统一为 {event:...}(BUG-5)。
-                # payload 此处为错误信息字符串。
                 return {"event": "error", "msg": payload}
         elif cmd == "query":
-            return self.activity.query(req.get("player_id", ""))
+            player_id = self._player_id_for(req, conn, fallback_pid)
+            return self.activity.query(player_id)
         elif cmd == "play":
-            player_id = req.get("player_id", "")
+            player_id = self._player_id_for(req, conn, fallback_pid)
             move = req.get("move", "")
             ok, msg = self.activity.play(player_id, move)
             if ok:
@@ -112,7 +137,7 @@ class Server:
             else:
                 return {"event": "error", "msg": msg}
         elif cmd == "buy":
-            player_id = req.get("player_id", "")
+            player_id = self._player_id_for(req, conn, fallback_pid)
             item = req.get("item", "")
             ok, msg = self.activity.buy(player_id, item)
             if ok:

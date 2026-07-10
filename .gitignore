@@ -3,3 +3,8 @@ __pycache__/*
 runtime/*
 *.code-workspace
 *.txt
+*.json
+.coverage
+.ai-test/*
+.pytest_cache/*
+tests/*
